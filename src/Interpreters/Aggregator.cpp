@@ -240,43 +240,46 @@ namespace DB
 
 size_t Aggregator::estimateSizeOfCompressedState(AggregatedDataVariants & result, ssize_t bucket) const
 {
-    auto estimate_size_of_compressed_state = [&](auto & table)
+    auto estimate_size_of_compressed_state = [&](auto & table) -> size_t
     {
-        size_t res = 0;
-        /// Void-mapped methods have no aggregate states, hence no compressed state to estimate.
         /// Set-mode tables (GROUP BY without aggregates) report `VoidMapped`; `AggregationMethodMapped`
-        /// collapses that to `void`, so this skips them - they have no aggregate state to size.
-        if constexpr (!std::is_void_v<AggregationMethodMapped<std::decay_t<decltype(table)>>>)
+        /// collapses that to `void`. They hold no aggregate states, so there is nothing to estimate - and
+        /// no `forEachMapped` to walk either, hence the `else`: the code below must stay uninstantiated
+        /// for them, which an early `return` alone would not achieve.
+        if constexpr (std::is_void_v<AggregationMethodMapped<std::decay_t<decltype(table)>>>)
+            return 0;
+        else
         {
-        for (size_t j = 0; j < params.aggregates_size; ++j)
-        {
-            /// We only interested in the size of compressed state, not the serialized representation itself.
-            NullWriteBuffer wb;
-            CompressedWriteBuffer wbuf(wb);
+            size_t res = 0;
+            for (size_t j = 0; j < params.aggregates_size; ++j)
+            {
+                /// We only interested in the size of compressed state, not the serialized representation itself.
+                NullWriteBuffer wb;
+                CompressedWriteBuffer wbuf(wb);
 
-            /// In single-level case (bucket == -1) we need to choose smaller sampling periods, because we have only one hash table.
-            /// In two-level case we sample across 256 buckets, so we can use a larger period.
-            const auto period = bucket == -1 ? std::min<size_t>(std::max<size_t>(table.size() / 100, 1), 100) : 100;
+                /// In single-level case (bucket == -1) we need to choose smaller sampling periods, because we have only one hash table.
+                /// In two-level case we sample across 256 buckets, so we can use a larger period.
+                const auto period = bucket == -1 ? std::min<size_t>(std::max<size_t>(table.size() / 100, 1), 100) : 100;
 
-            size_t it = 0;
-            table.forEachMapped(
-                [&](AggregateDataPtr place)
-                {
-                    chassert(place);
-                    if (it++ % period == 0)
+                size_t it = 0;
+                table.forEachMapped(
+                    [&](AggregateDataPtr place)
                     {
-                        is_simple_count ? writeVarUInt(getInlineCountState(place), wb)
-                                        : aggregate_functions[j]->serialize(place + offsets_of_aggregate_states[j], wb);
-                    }
-                    /// A hundred samples should be enough to get a good estimate.
-                    return it < 100 * period;
-                });
+                        chassert(place);
+                        if (it++ % period == 0)
+                        {
+                            is_simple_count ? writeVarUInt(getInlineCountState(place), wb)
+                                            : aggregate_functions[j]->serialize(place + offsets_of_aggregate_states[j], wb);
+                        }
+                        /// A hundred samples should be enough to get a good estimate.
+                        return it < 100 * period;
+                    });
 
-            wbuf.finalize();
-            res += it ? static_cast<size_t>(table.size() * wb.count() / ((it + period - 1) / period)) : 0;
+                wbuf.finalize();
+                res += it ? static_cast<size_t>(table.size() * wb.count() / ((it + period - 1) / period)) : 0;
+            }
+            return res;
         }
-        }
-        return res;
     };
 
     if (result.type == AggregatedDataVariants::Type::EMPTY)
@@ -1137,90 +1140,162 @@ void NO_INLINE Aggregator::executeImplBatch(
     /// so guard the rest of the function so it is not instantiated when `State::has_mapped == false`.
     if constexpr (State::has_mapped)
     {
-    /// Optimization for special case when aggregating by 8bit key.
-    if (!no_more_keys)
-    {
-        if constexpr (std::is_same_v<Method, typename decltype(AggregatedDataVariants::key8)::element_type>)
+        /// Optimization for special case when aggregating by 8bit key.
+        if (!no_more_keys)
         {
-            if (!all_keys_are_const)
+            if constexpr (std::is_same_v<Method, typename decltype(AggregatedDataVariants::key8)::element_type>)
             {
-                if (is_simple_count)
+                if (!all_keys_are_const)
                 {
-                    const auto * key = state.getKeyData();
-                    UInt64 * map = reinterpret_cast<UInt64 *>(method.data.data());
-                    for (size_t i = row_begin; i < row_end; ++i)
-                        ++map[key[i]];
-                    return;
-                }
-
-                /// We use another method if there are aggregate functions with -Array combinator.
-                bool has_arrays = false;
-                for (AggregateFunctionInstruction * inst = aggregate_instructions; inst->that; ++inst)
-                {
-                    if (inst->offsets)
+                    if (is_simple_count)
                     {
-                        has_arrays = true;
-                        break;
+                        const auto * key = state.getKeyData();
+                        UInt64 * map = reinterpret_cast<UInt64 *>(method.data.data());
+                        for (size_t i = row_begin; i < row_end; ++i)
+                            ++map[key[i]];
+                        return;
                     }
-                }
 
-                if (!has_arrays && !hasSparseArguments(aggregate_instructions))
-                {
+                    /// We use another method if there are aggregate functions with -Array combinator.
+                    bool has_arrays = false;
                     for (AggregateFunctionInstruction * inst = aggregate_instructions; inst->that; ++inst)
                     {
-                        inst->batch_that->addBatchLookupTable8(
-                            row_begin,
-                            row_end,
-                            reinterpret_cast<AggregateDataPtr *>(method.data.data()),
-                            inst->state_offset,
-                            [&](AggregateDataPtr & aggregate_data)
-                            {
-                                AggregateDataPtr place
-                                    = aggregates_pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
-                                createAggregateStates(place);
-                                aggregate_data = place;
-                            },
-                            state.getKeyData(),
-                            inst->batch_arguments,
-                            aggregates_pool);
+                        if (inst->offsets)
+                        {
+                            has_arrays = true;
+                            break;
+                        }
                     }
-                    return;
+
+                    if (!has_arrays && !hasSparseArguments(aggregate_instructions))
+                    {
+                        for (AggregateFunctionInstruction * inst = aggregate_instructions; inst->that; ++inst)
+                        {
+                            inst->batch_that->addBatchLookupTable8(
+                                row_begin,
+                                row_end,
+                                reinterpret_cast<AggregateDataPtr *>(method.data.data()),
+                                inst->state_offset,
+                                [&](AggregateDataPtr & aggregate_data)
+                                {
+                                    AggregateDataPtr place
+                                        = aggregates_pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
+                                    createAggregateStates(place);
+                                    aggregate_data = place;
+                                },
+                                state.getKeyData(),
+                                inst->batch_arguments,
+                                aggregates_pool);
+                        }
+                        return;
+                    }
                 }
             }
         }
-    }
 
-    if (is_simple_count)
-    {
-        if (all_keys_are_const)
+        if (is_simple_count)
         {
-            if (!no_more_keys)
+            if (all_keys_are_const)
             {
-                auto emplace_result = state.emplaceKey(method.data, 0, *aggregates_pool);
-                if (emplace_result.isInserted())
-                    getInlineCountState(emplace_result.getMapped()) = row_end - row_begin;
+                if (!no_more_keys)
+                {
+                    auto emplace_result = state.emplaceKey(method.data, 0, *aggregates_pool);
+                    if (emplace_result.isInserted())
+                        getInlineCountState(emplace_result.getMapped()) = row_end - row_begin;
+                    else
+                        getInlineCountState(emplace_result.getMapped()) += row_end - row_begin;
+                }
                 else
-                    getInlineCountState(emplace_result.getMapped()) += row_end - row_begin;
+                {
+                    auto find_result = state.findKey(method.data, 0, *aggregates_pool);
+                    if (find_result.isFound())
+                        getInlineCountState(find_result.getMapped()) = row_end - row_begin;
+                    else if (overflow_row)
+                        getCountState(overflow_row) += row_end - row_begin;
+                }
+            }
+            else if (!no_more_keys)
+            {
+                for (size_t i = row_begin; i < row_end; ++i)
+                {
+                    if constexpr (prefetch && HasPrefetchMemberFunc<decltype(method.data), KeyHolder>)
+                    {
+                        if (i == row_begin + PrefetchingHelper::iterationsToMeasure())
+                            prefetch_look_ahead = prefetching.calcPrefetchLookAhead();
+
+                        if (i + prefetch_look_ahead < row_end)
+                        {
+                            auto && key_holder = state.getKeyHolder(i + prefetch_look_ahead, *aggregates_pool);
+                            method.data.prefetch(std::move(key_holder));
+                        }
+                    }
+
+                    auto emplace_result = state.emplaceKey(method.data, i, *aggregates_pool);
+                    if (emplace_result.isInserted())
+                        getInlineCountState(emplace_result.getMapped()) = 1;
+                    else
+                        ++getInlineCountState(emplace_result.getMapped());
+                }
             }
             else
             {
-                auto find_result = state.findKey(method.data, 0, *aggregates_pool);
-                if (find_result.isFound())
-                    getInlineCountState(find_result.getMapped()) = row_end - row_begin;
-                else if (overflow_row)
-                    getCountState(overflow_row) += row_end - row_begin;
+                for (size_t i = row_begin; i < row_end; ++i)
+                {
+                    auto find_result = state.findKey(method.data, i, *aggregates_pool);
+                    if (find_result.isFound())
+                        ++getInlineCountState(find_result.getMapped());
+                    else if (overflow_row)
+                        ++getCountState(overflow_row);
+                }
             }
+
+            return;
         }
-        else if (!no_more_keys)
+
+        /// NOTE: only row_end-row_start is required, but:
+        /// - this affects only optimize_aggregation_in_order,
+        /// - this is just a pointer, so it should not be significant,
+        /// - and plus this will require other changes in the interface.
+        size_t places_size = all_keys_are_const ? 1 : row_end;
+        AllocatorWithMemoryTracking<AggregateDataPtr> allocator;
+        auto places_deleter = [&allocator, &places_size](auto * ptr)
         {
-            for (size_t i = row_begin; i < row_end; ++i)
+            if (ptr) [[likely]]
+                allocator.deallocate(ptr, places_size);
+        };
+        std::unique_ptr<AggregateDataPtr[], decltype(places_deleter)> places(allocator.allocate(places_size), places_deleter);
+
+        size_t key_start = 0;
+        size_t key_end = 0;
+        /// If all keys are const, key columns contain only 1 row.
+        if  (all_keys_are_const)
+        {
+            key_start = 0;
+            key_end = 1;
+        }
+        else
+        {
+            key_start = row_begin;
+            key_end = row_end;
+        }
+
+        state.resetCache();
+
+        /// For all rows.
+        if (!no_more_keys)
+        {
+            for (size_t i = key_start; i < key_end; ++i)
             {
+                AggregateDataPtr aggregate_data = nullptr;
+
                 if constexpr (prefetch && HasPrefetchMemberFunc<decltype(method.data), KeyHolder>)
                 {
-                    if (i == row_begin + PrefetchingHelper::iterationsToMeasure())
+                    if (i == key_start + PrefetchingHelper::iterationsToMeasure())
                         prefetch_look_ahead = prefetching.calcPrefetchLookAhead();
 
-                    if (i + prefetch_look_ahead < row_end)
+                    /// Bound by `key_end` (not `row_end`): when all keys are const the key
+                    /// columns hold 1 row, so the look-ahead must not cross that row.
+                    if (i + prefetch_look_ahead < key_end)
                     {
                         auto && key_holder = state.getKeyHolder(i + prefetch_look_ahead, *aggregates_pool);
                         method.data.prefetch(std::move(key_holder));
@@ -1228,139 +1303,67 @@ void NO_INLINE Aggregator::executeImplBatch(
                 }
 
                 auto emplace_result = state.emplaceKey(method.data, i, *aggregates_pool);
+
+                /// If a new key is inserted, initialize the states of the aggregate functions, and possibly something related to the key.
                 if (emplace_result.isInserted())
-                    getInlineCountState(emplace_result.getMapped()) = 1;
+                {
+                    /// exception-safety - if you can not allocate memory or create states, then destructors will not be called.
+                    emplace_result.setMapped(nullptr);
+
+                    aggregate_data = aggregates_pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
+
+    #if USE_EMBEDDED_COMPILER
+                    if (use_compiled_functions)
+                    {
+                        const auto & compiled_aggregate_functions = compiled_aggregate_functions_holder->compiled_aggregate_functions;
+                        callJITFunction(compiled_aggregate_functions.create_aggregate_states_function, aggregate_data);
+                        if (compiled_aggregate_functions.functions_count != aggregate_functions.size())
+                        {
+                            static constexpr bool skip_compiled_aggregate_functions = true;
+                            createAggregateStates<skip_compiled_aggregate_functions>(aggregate_data);
+                        }
+                    }
+                    else
+    #endif
+                    {
+                        createAggregateStates(aggregate_data);
+                    }
+
+                    emplace_result.setMapped(aggregate_data);
+                }
                 else
-                    ++getInlineCountState(emplace_result.getMapped());
+                    aggregate_data = emplace_result.getMapped();
+
+                chassert(aggregate_data != nullptr);
+                places[i] = aggregate_data;
             }
         }
         else
         {
-            for (size_t i = row_begin; i < row_end; ++i)
+            for (size_t i = key_start; i < key_end; ++i)
             {
+                AggregateDataPtr aggregate_data = nullptr;
+                /// Add only if the key already exists.
                 auto find_result = state.findKey(method.data, i, *aggregates_pool);
                 if (find_result.isFound())
-                    ++getInlineCountState(find_result.getMapped());
-                else if (overflow_row)
-                    ++getCountState(overflow_row);
-            }
-        }
-
-        return;
-    }
-
-    /// NOTE: only row_end-row_start is required, but:
-    /// - this affects only optimize_aggregation_in_order,
-    /// - this is just a pointer, so it should not be significant,
-    /// - and plus this will require other changes in the interface.
-    size_t places_size = all_keys_are_const ? 1 : row_end;
-    AllocatorWithMemoryTracking<AggregateDataPtr> allocator;
-    auto places_deleter = [&allocator, &places_size](auto * ptr)
-    {
-        if (ptr) [[likely]]
-            allocator.deallocate(ptr, places_size);
-    };
-    std::unique_ptr<AggregateDataPtr[], decltype(places_deleter)> places(allocator.allocate(places_size), places_deleter);
-
-    size_t key_start = 0;
-    size_t key_end = 0;
-    /// If all keys are const, key columns contain only 1 row.
-    if  (all_keys_are_const)
-    {
-        key_start = 0;
-        key_end = 1;
-    }
-    else
-    {
-        key_start = row_begin;
-        key_end = row_end;
-    }
-
-    state.resetCache();
-
-    /// For all rows.
-    if (!no_more_keys)
-    {
-        for (size_t i = key_start; i < key_end; ++i)
-        {
-            AggregateDataPtr aggregate_data = nullptr;
-
-            if constexpr (prefetch && HasPrefetchMemberFunc<decltype(method.data), KeyHolder>)
-            {
-                if (i == key_start + PrefetchingHelper::iterationsToMeasure())
-                    prefetch_look_ahead = prefetching.calcPrefetchLookAhead();
-
-                /// Bound by `key_end` (not `row_end`): when all keys are const the key
-                /// columns hold 1 row, so the look-ahead must not cross that row.
-                if (i + prefetch_look_ahead < key_end)
-                {
-                    auto && key_holder = state.getKeyHolder(i + prefetch_look_ahead, *aggregates_pool);
-                    method.data.prefetch(std::move(key_holder));
-                }
-            }
-
-            auto emplace_result = state.emplaceKey(method.data, i, *aggregates_pool);
-
-            /// If a new key is inserted, initialize the states of the aggregate functions, and possibly something related to the key.
-            if (emplace_result.isInserted())
-            {
-                /// exception-safety - if you can not allocate memory or create states, then destructors will not be called.
-                emplace_result.setMapped(nullptr);
-
-                aggregate_data = aggregates_pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
-
-#if USE_EMBEDDED_COMPILER
-                if (use_compiled_functions)
-                {
-                    const auto & compiled_aggregate_functions = compiled_aggregate_functions_holder->compiled_aggregate_functions;
-                    callJITFunction(compiled_aggregate_functions.create_aggregate_states_function, aggregate_data);
-                    if (compiled_aggregate_functions.functions_count != aggregate_functions.size())
-                    {
-                        static constexpr bool skip_compiled_aggregate_functions = true;
-                        createAggregateStates<skip_compiled_aggregate_functions>(aggregate_data);
-                    }
-                }
+                    aggregate_data = find_result.getMapped();
                 else
-#endif
-                {
-                    createAggregateStates(aggregate_data);
-                }
-
-                emplace_result.setMapped(aggregate_data);
+                    aggregate_data = overflow_row;
+                places[i] = aggregate_data;
             }
-            else
-                aggregate_data = emplace_result.getMapped();
-
-            chassert(aggregate_data != nullptr);
-            places[i] = aggregate_data;
         }
-    }
-    else
-    {
-        for (size_t i = key_start; i < key_end; ++i)
-        {
-            AggregateDataPtr aggregate_data = nullptr;
-            /// Add only if the key already exists.
-            auto find_result = state.findKey(method.data, i, *aggregates_pool);
-            if (find_result.isFound())
-                aggregate_data = find_result.getMapped();
-            else
-                aggregate_data = overflow_row;
-            places[i] = aggregate_data;
-        }
-    }
 
-    executeAggregateInstructions(
-        aggregates_pool,
-        row_begin,
-        row_end,
-        aggregate_instructions,
-        places.get(),
-        key_start,
-        state.hasOnlyOneValueSinceLastReset(),
-        all_keys_are_const,
-        use_compiled_functions);
-    } /// end of `if constexpr (State::has_mapped)`
+        executeAggregateInstructions(
+            aggregates_pool,
+            row_begin,
+            row_end,
+            aggregate_instructions,
+            places.get(),
+            key_start,
+            state.hasOnlyOneValueSinceLastReset(),
+            all_keys_are_const,
+            use_compiled_functions);
+    }
 }
 
 void Aggregator::executeAggregateInstructions(
@@ -2401,113 +2404,113 @@ Aggregator::convertToBlockImpl(Method & method, Table & data, Arena * arena, Are
     /// methods that have a mapped value. Void-mapped methods (no aggregates) never set is_simple_count.
     if constexpr (Method::State::has_mapped)
     {
-    if (is_simple_count)
-    {
-        /// +1 for nullKeyData, if `data` doesn't have it - not a problem, just some memory for one excessive row will be preallocated
-        const size_t max_block_size = (return_single_block ? data.size() : std::min(params.max_block_size, data.size())) + 1;
-
-        std::optional<OutputBlockColumns> out_cols;
-        std::optional<Sizes> shuffled_key_sizes;
-        Chunks chunks;
-        AggregateFunctionCountData * states = nullptr;
-        size_t rows_in_current_block = 0;
-        size_t rows_in_states = 0;
-        ColumnUInt64 * out_count_col = nullptr;
-
-        /// Allocates enough count states (+1 for nullKeyData) to store inlined states in data.
-        if (!final)
+        if (is_simple_count)
         {
-            states = reinterpret_cast<AggregateFunctionCountData *>(
-                arena->alignedAlloc(sizeof(AggregateFunctionCountData) * (data.size() + 1), alignof(AggregateFunctionCountData)));
-        }
+            /// +1 for nullKeyData, if `data` doesn't have it - not a problem, just some memory for one excessive row will be preallocated
+            const size_t max_block_size = (return_single_block ? data.size() : std::min(params.max_block_size, data.size())) + 1;
 
-        auto init_out_cols = [&]()
-        {
-            out_cols = prepareOutputBlockColumns(params, aggregate_functions, key_types, aggregate_state_types, aggregates_pools, final, max_block_size);
+            std::optional<OutputBlockColumns> out_cols;
+            std::optional<Sizes> shuffled_key_sizes;
+            Chunks chunks;
+            AggregateFunctionCountData * states = nullptr;
+            size_t rows_in_current_block = 0;
+            size_t rows_in_states = 0;
+            ColumnUInt64 * out_count_col = nullptr;
+
+            /// Allocates enough count states (+1 for nullKeyData) to store inlined states in data.
+            if (!final)
+            {
+                states = reinterpret_cast<AggregateFunctionCountData *>(
+                    arena->alignedAlloc(sizeof(AggregateFunctionCountData) * (data.size() + 1), alignof(AggregateFunctionCountData)));
+            }
+
+            auto init_out_cols = [&]()
+            {
+                out_cols = prepareOutputBlockColumns(params, aggregate_functions, key_types, aggregate_state_types, aggregates_pools, final, max_block_size);
+
+                if (final)
+                    out_count_col = assert_cast<ColumnUInt64 *>(out_cols->final_aggregate_columns[0].get());
+
+                if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
+                {
+                    /**
+                     * When one_key_nullable_optimization is enabled, null data will be written to the key column and result column in advance.
+                     * And in insertResultsIntoColumns need to allocate memory for null data.
+                     */
+                    if (data.hasNullKeyData())
+                    {
+                        if (final)
+                        {
+                            out_cols->key_columns[0]->insertDefault();
+                            out_count_col->insertValue(getInlineCountState(data.getNullKeyData()));
+                            data.hasNullKeyData() = false;
+                        }
+                        else
+                        {
+                            out_cols->raw_key_columns[0]->insertDefault();
+                            states[rows_in_states].count = getInlineCountState(data.getNullKeyData());
+                            out_cols->aggregate_columns_data[0]->push_back(reinterpret_cast<AggregateDataPtr>(&states[rows_in_states]));
+
+                            ++rows_in_states;
+                            data.getNullKeyData() = nullptr;
+                            data.hasNullKeyData() = false;
+                        }
+
+                        ++rows_in_current_block;
+                    }
+                }
+
+                shuffled_key_sizes = method.shuffleKeyColumns(out_cols->raw_key_columns, key_sizes);
+            };
+
+            init_out_cols();
+            auto fill_blocks = [&]<bool is_final>(const auto & key, auto & mapped)
+            {
+                if (!out_cols.has_value())
+                    init_out_cols();
+
+                const auto & key_sizes_ref = shuffled_key_sizes ? *shuffled_key_sizes : key_sizes;
+                IColumn::SerializationSettings serialization_settings{
+                    .serialize_string_with_zero_byte = params.serialize_string_with_zero_byte};
+                method.insertKeyIntoColumns(key, out_cols->raw_key_columns, key_sizes_ref, &serialization_settings);
+
+                if constexpr (is_final)
+                {
+                    out_count_col->insertValue(getInlineCountState(mapped));
+                }
+                else
+                {
+                    states[rows_in_states].count = getInlineCountState(mapped);
+                    out_cols->aggregate_columns_data[0]->push_back(reinterpret_cast<AggregateDataPtr>(&states[rows_in_states]));
+                }
+
+                ++rows_in_current_block;
+                ++rows_in_states;
+                if (!return_single_block && rows_in_current_block >= max_block_size)
+                {
+                    chunks.emplace_back(finalizeChunk(params, std::move(out_cols.value()), final));
+                    out_cols.reset();
+                    rows_in_current_block = 0;
+                }
+            };
 
             if (final)
-                out_count_col = assert_cast<ColumnUInt64 *>(out_cols->final_aggregate_columns[0].get());
-
-            if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
-            {
-                /**
-                 * When one_key_nullable_optimization is enabled, null data will be written to the key column and result column in advance.
-                 * And in insertResultsIntoColumns need to allocate memory for null data.
-                 */
-                if (data.hasNullKeyData())
-                {
-                    if (final)
-                    {
-                        out_cols->key_columns[0]->insertDefault();
-                        out_count_col->insertValue(getInlineCountState(data.getNullKeyData()));
-                        data.hasNullKeyData() = false;
-                    }
-                    else
-                    {
-                        out_cols->raw_key_columns[0]->insertDefault();
-                        states[rows_in_states].count = getInlineCountState(data.getNullKeyData());
-                        out_cols->aggregate_columns_data[0]->push_back(reinterpret_cast<AggregateDataPtr>(&states[rows_in_states]));
-
-                        ++rows_in_states;
-                        data.getNullKeyData() = nullptr;
-                        data.hasNullKeyData() = false;
-                    }
-
-                    ++rows_in_current_block;
-                }
-            }
-
-            shuffled_key_sizes = method.shuffleKeyColumns(out_cols->raw_key_columns, key_sizes);
-        };
-
-        init_out_cols();
-        auto fill_blocks = [&]<bool is_final>(const auto & key, auto & mapped)
-        {
-            if (!out_cols.has_value())
-                init_out_cols();
-
-            const auto & key_sizes_ref = shuffled_key_sizes ? *shuffled_key_sizes : key_sizes;
-            IColumn::SerializationSettings serialization_settings{
-                .serialize_string_with_zero_byte = params.serialize_string_with_zero_byte};
-            method.insertKeyIntoColumns(key, out_cols->raw_key_columns, key_sizes_ref, &serialization_settings);
-
-            if constexpr (is_final)
-            {
-                out_count_col->insertValue(getInlineCountState(mapped));
-            }
+                data.forEachValue([&](const auto & key, auto & mapped) { fill_blocks.template operator()<true>(key, mapped); });
             else
+                data.forEachValue([&](const auto & key, auto & mapped) { fill_blocks.template operator()<false>(key, mapped); });
+
+            if (return_single_block)
             {
-                states[rows_in_states].count = getInlineCountState(mapped);
-                out_cols->aggregate_columns_data[0]->push_back(reinterpret_cast<AggregateDataPtr>(&states[rows_in_states]));
+                chunks.emplace_back(finalizeChunk(params, std::move(out_cols).value(), final));
+                return chunks;
             }
 
-            ++rows_in_current_block;
-            ++rows_in_states;
-            if (!return_single_block && rows_in_current_block >= max_block_size)
-            {
-                chunks.emplace_back(finalizeChunk(params, std::move(out_cols.value()), final));
-                out_cols.reset();
-                rows_in_current_block = 0;
-            }
-        };
+            if (rows_in_current_block)
+                chunks.emplace_back(finalizeChunk(params, std::move(out_cols).value(), final));
 
-        if (final)
-            data.forEachValue([&](const auto & key, auto & mapped) { fill_blocks.template operator()<true>(key, mapped); });
-        else
-            data.forEachValue([&](const auto & key, auto & mapped) { fill_blocks.template operator()<false>(key, mapped); });
-
-        if (return_single_block)
-        {
-            chunks.emplace_back(finalizeChunk(params, std::move(out_cols).value(), final));
             return chunks;
         }
-
-        if (rows_in_current_block)
-            chunks.emplace_back(finalizeChunk(params, std::move(out_cols).value(), final));
-
-        return chunks;
     }
-    } /// end of `if constexpr (Method::State::has_mapped)` guarding the inline-count convert path
 
     bool use_compiled_functions = false;
     if (final)
@@ -3187,17 +3190,55 @@ void NO_INLINE Aggregator::mergeDataImpl(
     }
     else
     {
-    if (is_simple_count)
-    {
+        if (is_simple_count)
+        {
+            if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
+                mergeDataNullKeySimpleCount(table_dst, table_src);
+
+            auto merge = [&](AggregateDataPtr & __restrict dst, AggregateDataPtr & __restrict src, bool inserted)
+            {
+                if (inserted)
+                    getInlineCountState(dst) = getInlineCountState(src);
+                else
+                    getInlineCountState(dst) += getInlineCountState(src);
+            };
+
+            if (parallel_worker)
+            {
+                if constexpr (std::is_same_v<Method, typename decltype(AggregatedDataVariants::key8)::element_type> ||
+                    std::is_same_v<Method, typename decltype(AggregatedDataVariants::key16)::element_type>)
+                    table_src.mergeToViaIndexFilter(table_dst, std::move(merge), parallel_worker->worker_id, parallel_worker->total_worker);
+            }
+            else
+            {
+                if (prefetch)
+                    table_src.template mergeToViaEmplace<decltype(merge), true>(table_dst, std::move(merge));
+                else
+                    table_src.template mergeToViaEmplace<decltype(merge), false>(table_dst, std::move(merge));
+                table_src.clearAndShrink();
+            }
+            return;
+        }
+
         if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
-            mergeDataNullKeySimpleCount(table_dst, table_src);
+            mergeDataNullKey<Method, Table>(table_dst, table_src, arena);
+
+        PaddedPODArray<AggregateDataPtr> dst_places;
+        PaddedPODArray<AggregateDataPtr> src_places;
 
         auto merge = [&](AggregateDataPtr & __restrict dst, AggregateDataPtr & __restrict src, bool inserted)
         {
-            if (inserted)
-                getInlineCountState(dst) = getInlineCountState(src);
+            if (!inserted)
+            {
+                dst_places.push_back(dst);
+                src_places.push_back(src);
+            }
             else
-                getInlineCountState(dst) += getInlineCountState(src);
+            {
+                dst = src;
+            }
+
+            src = nullptr;
         };
 
         if (parallel_worker)
@@ -3214,68 +3255,30 @@ void NO_INLINE Aggregator::mergeDataImpl(
                 table_src.template mergeToViaEmplace<decltype(merge), false>(table_dst, std::move(merge));
             table_src.clearAndShrink();
         }
-        return;
-    }
 
-    if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
-        mergeDataNullKey<Method, Table>(table_dst, table_src, arena);
-
-    PaddedPODArray<AggregateDataPtr> dst_places;
-    PaddedPODArray<AggregateDataPtr> src_places;
-
-    auto merge = [&](AggregateDataPtr & __restrict dst, AggregateDataPtr & __restrict src, bool inserted)
-    {
-        if (!inserted)
+    #if USE_EMBEDDED_COMPILER
+        if (use_compiled_functions)
         {
-            dst_places.push_back(dst);
-            src_places.push_back(src);
+            const auto & compiled_functions = compiled_aggregate_functions_holder->compiled_aggregate_functions;
+            callJITFunction(compiled_functions.merge_aggregate_states_function, dst_places.data(), src_places.data(), dst_places.size());
+
+            for (size_t i = 0; i < params.aggregates_size; ++i)
+            {
+                if (!is_aggregate_function_compiled[i])
+                    aggregate_functions[i]->mergeAndDestroyBatch(
+                        dst_places.data(), src_places.data(), dst_places.size(), offsets_of_aggregate_states[i], *thread_pool, is_cancelled, arena);
+            }
+
+            return;
         }
-        else
-        {
-            dst = src;
-        }
-
-        src = nullptr;
-    };
-
-    if (parallel_worker)
-    {
-        if constexpr (std::is_same_v<Method, typename decltype(AggregatedDataVariants::key8)::element_type> ||
-            std::is_same_v<Method, typename decltype(AggregatedDataVariants::key16)::element_type>)
-            table_src.mergeToViaIndexFilter(table_dst, std::move(merge), parallel_worker->worker_id, parallel_worker->total_worker);
-    }
-    else
-    {
-        if (prefetch)
-            table_src.template mergeToViaEmplace<decltype(merge), true>(table_dst, std::move(merge));
-        else
-            table_src.template mergeToViaEmplace<decltype(merge), false>(table_dst, std::move(merge));
-        table_src.clearAndShrink();
-    }
-
-#if USE_EMBEDDED_COMPILER
-    if (use_compiled_functions)
-    {
-        const auto & compiled_functions = compiled_aggregate_functions_holder->compiled_aggregate_functions;
-        callJITFunction(compiled_functions.merge_aggregate_states_function, dst_places.data(), src_places.data(), dst_places.size());
+    #endif
 
         for (size_t i = 0; i < params.aggregates_size; ++i)
         {
-            if (!is_aggregate_function_compiled[i])
-                aggregate_functions[i]->mergeAndDestroyBatch(
-                    dst_places.data(), src_places.data(), dst_places.size(), offsets_of_aggregate_states[i], *thread_pool, is_cancelled, arena);
+            aggregate_functions[i]->mergeAndDestroyBatch(
+                dst_places.data(), src_places.data(), dst_places.size(), offsets_of_aggregate_states[i], *thread_pool, is_cancelled, arena);
         }
-
-        return;
     }
-#endif
-
-    for (size_t i = 0; i < params.aggregates_size; ++i)
-    {
-        aggregate_functions[i]->mergeAndDestroyBatch(
-            dst_places.data(), src_places.data(), dst_places.size(), offsets_of_aggregate_states[i], *thread_pool, is_cancelled, arena);
-    }
-    } /// end of `else` for the non-void-mapped path
 }
 
 
@@ -3289,48 +3292,46 @@ void NO_INLINE Aggregator::mergeDataNoMoreKeysImpl(
     /// Void-mapped methods have no aggregate states: a "merge only existing keys" is a no-op (the keys
     /// already present in dst stay, new keys in src are dropped/overflow as required).
     if constexpr (std::is_void_v<typename Method::Mapped>)
-    {
         return;
-    }
     else
     {
-    if (is_simple_count)
-    {
-        if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
-            mergeDataNullKeySimpleCount(table_dst, table_src);
-
-        table_src.mergeToViaFind(table_dst, [&](AggregateDataPtr & __restrict dst, AggregateDataPtr & __restrict src, bool found)
+        if (is_simple_count)
         {
-            if (found)
-                getInlineCountState(dst) += getInlineCountState(src);
-            else
-                getCountState(overflows) += getInlineCountState(src);
+            if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
+                mergeDataNullKeySimpleCount(table_dst, table_src);
+
+            table_src.mergeToViaFind(table_dst, [&](AggregateDataPtr & __restrict dst, AggregateDataPtr & __restrict src, bool found)
+            {
+                if (found)
+                    getInlineCountState(dst) += getInlineCountState(src);
+                else
+                    getCountState(overflows) += getInlineCountState(src);
+            });
+            table_src.clearAndShrink();
+            return;
+        }
+
+        /// Note : will create data for NULL key if not exist
+        if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
+            mergeDataNullKey<Method, Table>(table_dst, table_src, arena);
+
+        table_src.mergeToViaFind(table_dst, [&](AggregateDataPtr dst, AggregateDataPtr & src, bool found)
+        {
+            AggregateDataPtr res_data = found ? dst : overflows;
+
+            for (size_t i = 0; i < params.aggregates_size; ++i)
+                aggregate_functions[i]->merge(
+                    res_data + offsets_of_aggregate_states[i],
+                    src + offsets_of_aggregate_states[i],
+                    arena);
+
+            for (size_t i = 0; i < params.aggregates_size; ++i)
+                aggregate_functions[i]->destroy(src + offsets_of_aggregate_states[i]);
+
+            src = nullptr;
         });
         table_src.clearAndShrink();
-        return;
     }
-
-    /// Note : will create data for NULL key if not exist
-    if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
-        mergeDataNullKey<Method, Table>(table_dst, table_src, arena);
-
-    table_src.mergeToViaFind(table_dst, [&](AggregateDataPtr dst, AggregateDataPtr & src, bool found)
-    {
-        AggregateDataPtr res_data = found ? dst : overflows;
-
-        for (size_t i = 0; i < params.aggregates_size; ++i)
-            aggregate_functions[i]->merge(
-                res_data + offsets_of_aggregate_states[i],
-                src + offsets_of_aggregate_states[i],
-                arena);
-
-        for (size_t i = 0; i < params.aggregates_size; ++i)
-            aggregate_functions[i]->destroy(src + offsets_of_aggregate_states[i]);
-
-        src = nullptr;
-    });
-    table_src.clearAndShrink();
-    } /// end of `else` for the non-void-mapped path
 }
 
 template <typename Method, typename Table>
@@ -3341,49 +3342,47 @@ void NO_INLINE Aggregator::mergeDataOnlyExistingKeysImpl(
 {
     /// Void-mapped methods have no aggregate states: merging only existing keys is a no-op.
     if constexpr (std::is_void_v<typename Method::Mapped>)
-    {
         return;
-    }
     else
     {
-    if (is_simple_count)
-    {
-        if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
-            mergeDataNullKeySimpleCount(table_dst, table_src);
+        if (is_simple_count)
+        {
+            if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
+                mergeDataNullKeySimpleCount(table_dst, table_src);
 
-        table_src.mergeToViaFind(table_dst, [&](AggregateDataPtr & __restrict dst, AggregateDataPtr & __restrict src, bool found)
+            table_src.mergeToViaFind(table_dst, [&](AggregateDataPtr & __restrict dst, AggregateDataPtr & __restrict src, bool found)
+            {
+                if (!found)
+                    return;
+                getInlineCountState(dst) += getInlineCountState(src);
+            });
+            table_src.clearAndShrink();
+            return;
+        }
+
+        /// Note : will create data for NULL key if not exist
+        if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
+            mergeDataNullKey<Method, Table>(table_dst, table_src, arena);
+
+        table_src.mergeToViaFind(table_dst,
+            [&](AggregateDataPtr dst, AggregateDataPtr & src, bool found)
         {
             if (!found)
                 return;
-            getInlineCountState(dst) += getInlineCountState(src);
+
+            for (size_t i = 0; i < params.aggregates_size; ++i)
+                aggregate_functions[i]->merge(
+                    dst + offsets_of_aggregate_states[i],
+                    src + offsets_of_aggregate_states[i],
+                    arena);
+
+            for (size_t i = 0; i < params.aggregates_size; ++i)
+                aggregate_functions[i]->destroy(src + offsets_of_aggregate_states[i]);
+
+            src = nullptr;
         });
         table_src.clearAndShrink();
-        return;
     }
-
-    /// Note : will create data for NULL key if not exist
-    if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
-        mergeDataNullKey<Method, Table>(table_dst, table_src, arena);
-
-    table_src.mergeToViaFind(table_dst,
-        [&](AggregateDataPtr dst, AggregateDataPtr & src, bool found)
-    {
-        if (!found)
-            return;
-
-        for (size_t i = 0; i < params.aggregates_size; ++i)
-            aggregate_functions[i]->merge(
-                dst + offsets_of_aggregate_states[i],
-                src + offsets_of_aggregate_states[i],
-                arena);
-
-        for (size_t i = 0; i < params.aggregates_size; ++i)
-            aggregate_functions[i]->destroy(src + offsets_of_aggregate_states[i]);
-
-        src = nullptr;
-    });
-    table_src.clearAndShrink();
-    } /// end of `else` for the non-void-mapped path
 }
 
 
@@ -3672,59 +3671,59 @@ void NO_INLINE Aggregator::mergeStreamsImplCase(
     }
     else
     {
-    std::unique_ptr<AggregateDataPtr[]> places(new AggregateDataPtr[row_end]);
+        std::unique_ptr<AggregateDataPtr[]> places(new AggregateDataPtr[row_end]);
 
-    if (!arena_for_keys)
-        arena_for_keys = aggregates_pool;
+        if (!arena_for_keys)
+            arena_for_keys = aggregates_pool;
 
-    if (no_more_keys)
-    {
-        for (size_t i = row_begin; i < row_end; i++)
+        if (no_more_keys)
         {
-            auto find_result = state.findKey(data, i, *arena_for_keys);
-            /// aggregate_date == nullptr means that the new key did not fit in the hash table because of no_more_keys.
-            AggregateDataPtr value = find_result.isFound() ? find_result.getMapped() : overflow_row;
-            places[i] = value;
-        }
-    }
-    else
-    {
-        for (size_t i = row_begin; i < row_end; i++)
-        {
-            /// clang-tidy complains wrongly about this one when running the analysis from an ARM host.
-            /// The same thing does not fail when cross-compiling from a x86_64 host.
-            /// Furthermore, arena_for_keys is set to be a pointer to the last member of aggregates_pools,
-            /// which is always initialized to have at least 1 arena.
-            auto emplace_result = state.emplaceKey(data, i, *arena_for_keys); /// NOLINT(clang-analyzer-core.NonNullParamChecker)
-            if (!emplace_result.isInserted())
-                places[i] = emplace_result.getMapped();
-            else
+            for (size_t i = row_begin; i < row_end; i++)
             {
-                emplace_result.setMapped(nullptr);
-
-                AggregateDataPtr aggregate_data = aggregates_pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
-                createAggregateStates(aggregate_data);
-
-                emplace_result.setMapped(aggregate_data);
-                places[i] = aggregate_data;
+                auto find_result = state.findKey(data, i, *arena_for_keys);
+                /// aggregate_date == nullptr means that the new key did not fit in the hash table because of no_more_keys.
+                AggregateDataPtr value = find_result.isFound() ? find_result.getMapped() : overflow_row;
+                places[i] = value;
             }
         }
-    }
+        else
+        {
+            for (size_t i = row_begin; i < row_end; i++)
+            {
+                /// clang-tidy complains wrongly about this one when running the analysis from an ARM host.
+                /// The same thing does not fail when cross-compiling from a x86_64 host.
+                /// Furthermore, arena_for_keys is set to be a pointer to the last member of aggregates_pools,
+                /// which is always initialized to have at least 1 arena.
+                auto emplace_result = state.emplaceKey(data, i, *arena_for_keys); /// NOLINT(clang-analyzer-core.NonNullParamChecker)
+                if (!emplace_result.isInserted())
+                    places[i] = emplace_result.getMapped();
+                else
+                {
+                    emplace_result.setMapped(nullptr);
 
-    for (size_t j = 0; j < params.aggregates_size; ++j)
-    {
-        /// Merge state of aggregate functions.
-        aggregate_functions[j]->mergeBatch(
-            row_begin,
-            row_end,
-            places.get(),
-            offsets_of_aggregate_states[j],
-            aggregate_columns_data[j]->data(),
-            *thread_pool,
-            is_cancelled,
-            aggregates_pool);
+                    AggregateDataPtr aggregate_data = aggregates_pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
+                    createAggregateStates(aggregate_data);
+
+                    emplace_result.setMapped(aggregate_data);
+                    places[i] = aggregate_data;
+                }
+            }
+        }
+
+        for (size_t j = 0; j < params.aggregates_size; ++j)
+        {
+            /// Merge state of aggregate functions.
+            aggregate_functions[j]->mergeBatch(
+                row_begin,
+                row_end,
+                places.get(),
+                offsets_of_aggregate_states[j],
+                aggregate_columns_data[j]->data(),
+                *thread_pool,
+                is_cancelled,
+                aggregates_pool);
+        }
     }
-    } /// end of `else` for the non-void-mapped path
 }
 
 template <typename Method, typename Table>
@@ -3783,38 +3782,38 @@ void NO_INLINE Aggregator::mergeStreamsImpl(
         /// never for void/set-mode methods. Guarded so it is not instantiated when `has_mapped == false`.
         if constexpr (State::has_mapped)
         {
-        chassert(aggregate_columns_data.size() == 1);
-        if (!arena_for_keys)
-            arena_for_keys = aggregates_pool;
-        const auto & other_aggregated_counts = *aggregate_columns_data[0];
-        if (no_more_keys)
-        {
-            for (size_t row = row_begin; row < row_end; row++)
+            chassert(aggregate_columns_data.size() == 1);
+            if (!arena_for_keys)
+                arena_for_keys = aggregates_pool;
+            const auto & other_aggregated_counts = *aggregate_columns_data[0];
+            if (no_more_keys)
             {
-                auto find_result = state.findKey(data, row, *arena_for_keys);
+                for (size_t row = row_begin; row < row_end; row++)
+                {
+                    auto find_result = state.findKey(data, row, *arena_for_keys);
 
-                if (find_result.isFound())
-                    getInlineCountState(find_result.getMapped()) += getCountState(other_aggregated_counts[row]);
-                else if (overflow_row)
-                    getCountState(overflow_row) += getCountState(other_aggregated_counts[row]);
+                    if (find_result.isFound())
+                        getInlineCountState(find_result.getMapped()) += getCountState(other_aggregated_counts[row]);
+                    else if (overflow_row)
+                        getCountState(overflow_row) += getCountState(other_aggregated_counts[row]);
+                }
             }
-        }
-        else
-        {
-            for (size_t row = row_begin; row < row_end; row++)
+            else
             {
-                /// clang-tidy complains wrongly about this one when running the analysis from an ARM host.
-                /// The same thing does not fail when cross-compiling from a x86_64 host.
-                /// Furthermore, arena_for_keys is set to be a pointer to the last member of aggregates_pools,
-                /// which is always initialized to have at least 1 arena.
-                auto emplace_result = state.emplaceKey(data, row, *arena_for_keys); /// NOLINT(clang-analyzer-core.NonNullParamChecker)
-                if (emplace_result.isInserted())
-                    getInlineCountState(emplace_result.getMapped()) = getCountState(other_aggregated_counts[row]);
-                else
-                    getInlineCountState(emplace_result.getMapped()) += getCountState(other_aggregated_counts[row]);
+                for (size_t row = row_begin; row < row_end; row++)
+                {
+                    /// clang-tidy complains wrongly about this one when running the analysis from an ARM host.
+                    /// The same thing does not fail when cross-compiling from a x86_64 host.
+                    /// Furthermore, arena_for_keys is set to be a pointer to the last member of aggregates_pools,
+                    /// which is always initialized to have at least 1 arena.
+                    auto emplace_result = state.emplaceKey(data, row, *arena_for_keys); /// NOLINT(clang-analyzer-core.NonNullParamChecker)
+                    if (emplace_result.isInserted())
+                        getInlineCountState(emplace_result.getMapped()) = getCountState(other_aggregated_counts[row]);
+                    else
+                        getInlineCountState(emplace_result.getMapped()) += getCountState(other_aggregated_counts[row]);
+                }
             }
         }
-        } /// end of `if constexpr (State::has_mapped)`
     };
 
     if (use_cache)
@@ -4172,18 +4171,18 @@ Aggregator::AggregatedChunk Aggregator::mergeBlocks(
     auto merge_method = method_chosen;
 
 #define APPLY_FOR_VARIANTS_THAT_MAY_USE_BETTER_HASH_FUNCTION(M) \
-        M(key64)                          \
-        M(key64_void)                     \
-        M(keys128_void)                   \
-        M(keys256_void)                   \
-        M(key_string)                     \
-        M(key_fixed_string)               \
-        M(keys128)                        \
-        M(keys256)                        \
-        M(serialized)                     \
-        M(nullable_serialized)            \
-        M(prealloc_serialized)            \
-        M(nullable_prealloc_serialized)   \
+        M(key64)                               \
+        M(key64_void)                          \
+        M(keys128_void)                        \
+        M(keys256_void)                        \
+        M(key_string)                          \
+        M(key_fixed_string)                    \
+        M(keys128)                             \
+        M(keys256)                             \
+        M(serialized)                          \
+        M(nullable_serialized)                 \
+        M(prealloc_serialized)                 \
+        M(nullable_prealloc_serialized)        \
         M(serialized_void)                     \
         M(nullable_serialized_void)            \
         M(prealloc_serialized_void)            \
@@ -4426,32 +4425,32 @@ void NO_INLINE Aggregator::destroyImpl(Table & table) const
         return;
     else
     {
-    table.forEachMapped([&](AggregateDataPtr & data)
-    {
-        /** If an exception (usually a lack of memory, the MemoryTracker throws) arose
-          *  after inserting the key into a hash table, but before creating all states of aggregate functions,
-          *  then data will be equal nullptr.
-          */
-        if (nullptr == data)
-            return;
-
-        for (size_t i = 0; i < params.aggregates_size; ++i)
-            aggregate_functions[i]->destroy(data + offsets_of_aggregate_states[i]);
-
-        data = nullptr;
-    });
-
-    if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
-    {
-        if (table.getNullKeyData() != nullptr)
+        table.forEachMapped([&](AggregateDataPtr & data)
         {
-            for (size_t i = 0; i < params.aggregates_size; ++i)
-                aggregate_functions[i]->destroy(table.getNullKeyData() + offsets_of_aggregate_states[i]);
+            /** If an exception (usually a lack of memory, the MemoryTracker throws) arose
+              *  after inserting the key into a hash table, but before creating all states of aggregate functions,
+              *  then data will be equal nullptr.
+              */
+            if (nullptr == data)
+                return;
 
-            table.getNullKeyData() = nullptr;
+            for (size_t i = 0; i < params.aggregates_size; ++i)
+                aggregate_functions[i]->destroy(data + offsets_of_aggregate_states[i]);
+
+            data = nullptr;
+        });
+
+        if constexpr (Method::low_cardinality_optimization || Method::one_key_nullable_optimization)
+        {
+            if (table.getNullKeyData() != nullptr)
+            {
+                for (size_t i = 0; i < params.aggregates_size; ++i)
+                    aggregate_functions[i]->destroy(table.getNullKeyData() + offsets_of_aggregate_states[i]);
+
+                table.getNullKeyData() = nullptr;
+            }
         }
     }
-    } /// end of `else` for the non-void-mapped path
 }
 
 
